@@ -1,16 +1,23 @@
-"""SEC XBRL Frames API — cross-company comparison for a given concept.
+"""SEC EDGAR cross-company comparison via Company Concept API.
 
-Free, no auth. Goes beyond single-company EDGAR facts by letting the LLM
-ask "show me Revenues for ALL filers in Q1 2026" — useful for peer
-benchmarking during valuation analysis.
+Free, no auth. Uses the working `/api/xbrl/companyconcept/` endpoint
+(the `/api/xbrl/frames/` bulk cross-company endpoint is deprecated).
+
+The framework provides a "peer list" so the LLM can ask for a concept
+like Revenues and get the same value for the user's ticker + N peer
+companies side-by-side. Peer list is the intersection of (sector-relevant
+defaults) and (tickers the LLM knows about).
 
 Use case: when the framework says "AAOI forward PE 23.98 looks low",
-this tool pulls the same PE concept for the semiconductor peer set
+this tool pulls Revenues / NetIncome for the semiconductor peer set
 (MU, SNDK, NVDA, AMD, TSM, etc.) so the LLM has actual context.
 """
 from __future__ import annotations
 
+import json
 import logging
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -20,33 +27,27 @@ logger = logging.getLogger(__name__)
 USER_AGENT = "TradingAgentsCustom/0.1 chenzhen-trading@example.com"
 HEADERS = {"User-Agent": USER_AGENT, "Accept-Encoding": "gzip"}
 
+# Default semiconductor / AI / tech peer set used when no specific peer
+# list is requested. CIKs are looked up from the company_tickers map.
+DEFAULT_PEERS = [
+    "NVDA", "AMD", "INTC", "TSM", "MU", "SNDK", "MRVL", "AVGO", "TXN", "QCOM",
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META",  # hyperscaler customers
+]
 
-def _fetch_frame(concept: str, period_fiscal_year: int, period_fiscal_period: str) -> list[dict[str, Any]]:
-    """Pull the XBRL frame for a concept and a given fiscal period.
-
-    Args:
-        concept: e.g. "Revenues", "NetIncomeLoss", "Assets"
-        period_fiscal_year: e.g. 2026
-        period_fiscal_period: e.g. "FY" or "Q1"
-
-    Returns:
-        list of company facts for that concept/period
-    """
-    url = (
-        f"https://data.sec.gov/api/xbrl/frames/"
-        f"{concept}/USD/{period_fiscal_year}-{period_fiscal_period}.json"
-    )
-    resp = requests.get(url, headers=HEADERS, timeout=20)
-    resp.raise_for_status()
-    return resp.json().get("data", [])
+# Concept name aliases — EDGAR uses full us-gaap tag names, not short
+# GAAP terms. Map the common short forms the LLM will use.
+CONCEPT_ALIASES = {
+    "Revenues": ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet"],
+    "NetIncomeLoss": ["NetIncomeLoss", "ProfitLoss"],
+    "Assets": ["Assets"],
+    "Liabilities": ["Liabilities"],
+    "StockholdersEquity": ["StockholdersEquity"],
+    "CommonStockSharesOutstanding": ["CommonStockSharesOutstanding"],
+}
 
 
-def _get_company_ticker_map() -> dict[str, str]:
-    """Load SEC's ticker -> CIK map (cached locally for 7 days)."""
-    import json
-    from pathlib import Path
-    from datetime import datetime, timedelta
-
+def _get_company_ticker_map() -> dict[str, dict[str, Any]]:
+    """Load SEC's full ticker -> CIK mapping (cached locally for 7 days)."""
     cache_path = Path.home() / ".tradingagents" / "cache" / "edgar" / "company_tickers.json"
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     if cache_path.exists():
@@ -73,104 +74,138 @@ def _get_company_ticker_map() -> dict[str, str]:
         return {}
 
 
-def _cik_to_name(cik: str, ticker_map: dict[str, dict]) -> str:
-    """Look up company name by CIK from the SEC ticker map."""
+def _ticker_to_cik(ticker: str, ticker_map: dict[str, dict]) -> str | None:
+    """Resolve a ticker to its 10-digit zero-padded CIK."""
+    t = ticker.upper().replace("-", ".")
     for entry in ticker_map.values():
-        if str(entry.get("cik_str", "")).zfill(10) == cik:
-            return entry.get("title", "Unknown")
-    return f"CIK {cik}"
+        if entry.get("ticker", "").upper() == t:
+            cik = entry.get("cik_str")
+            if cik:
+                return str(cik).zfill(10)
+    return None
+
+
+def _fetch_concept(cik: str, concept_candidates: list[str]) -> tuple[dict, str] | tuple[None, None]:
+    """Fetch the most recent FY value for a concept for one company.
+
+    Tries each concept name in order (since EDGAR uses verbose us-gaap tags).
+    Returns (entry, concept_used) or (None, None) if all fail.
+    """
+    for concept in concept_candidates:
+        url = (
+            f"https://data.sec.gov/api/xbrl/companyconcept/"
+            f"CIK{cik}/us-gaap/{concept}.json"
+        )
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            units = data.get("units", {}).get("USD", [])
+            # Filter to 10-K (full year) filings
+            fy_entries = [e for e in units if e.get("form") == "10-K" and e.get("fp") == "FY"]
+            if not fy_entries:
+                continue
+            fy_entries.sort(key=lambda e: e.get("end", ""), reverse=True)
+            return fy_entries[0], concept
+        except Exception:
+            continue
+    return None, None
 
 
 def get_peer_comparison(
     ticker: str,
     concept: str = "Revenues",
-    period_fiscal_year: int = 2026,
-    period_fiscal_period: str = "FY",
-    top_n: int = 10,
+    peers: list[str] | None = None,
+    top_n: int = 8,
 ) -> str:
     """Cross-company comparison for a given XBRL concept.
 
     Args:
-        ticker: the user's ticker (used only to locate the user's company
-            in the comparison; peers are determined by the universe of filers
-            reporting this concept for the given period)
-        concept: GAAP concept to compare (e.g. "Revenues", "NetIncomeLoss",
-            "Assets", "StockholdersEquity", "Liabilities")
-        period_fiscal_year: e.g. 2026
-        period_fiscal_period: "FY" or "Q1".."Q4"
-        top_n: number of top companies by value to show
+        ticker: the user's ticker (used to locate the user's company)
+        concept: GAAP concept — accepts short names ("Revenues", "NetIncomeLoss",
+            "Assets", "Liabilities", "StockholdersEquity")
+        peers: list of peer tickers. None = use DEFAULT_PEERS
+        top_n: max number of peers to show
 
     Returns:
-        Formatted string with the user's company value + top peers,
-        sorted descending, ready for LLM context.
+        Formatted string with the user's company + peers side-by-side, sorted
+        descending, ready for LLM context.
     """
-    try:
-        all_data = _fetch_frame(concept, period_fiscal_year, period_fiscal_period)
-    except Exception as exc:
-        return f"sec_frames: fetch failed ({type(exc).__name__}: {exc})"
+    candidates = CONCEPT_ALIASES.get(concept, [concept])
+    peer_list = peers or DEFAULT_PEERS
+    target_peers = [p for p in peer_list if p.upper() != ticker.upper()][:top_n]
 
-    if not all_data:
-        return (
-            f"sec_frames: no data for {concept} "
-            f"{period_fiscal_year}-{period_fiscal_period}"
+    ticker_map = _get_company_ticker_map()
+    user_cik = _ticker_to_cik(ticker, ticker_map)
+    user_entry = next(
+        (e for e in ticker_map.values() if str(e.get("cik_str", "")).zfill(10) == user_cik),
+        None,
+    ) if user_cik else None
+
+    def _fetch_for(t: str) -> dict:
+        cik = _ticker_to_cik(t, ticker_map)
+        if not cik:
+            return {"ticker": t, "value": None, "name": t, "error": "CIK not found"}
+        entry, used_concept = _fetch_concept(cik, candidates)
+        if not entry:
+            return {
+                "ticker": t, "value": None, "name": t,
+                "error": f"no data for concepts {candidates}",
+            }
+        name = next(
+            (e.get("title", t) for e in ticker_map.values()
+             if str(e.get("cik_str", "")).zfill(10) == cik),
+            t,
         )
+        return {
+            "ticker": t,
+            "name": name,
+            "value": entry.get("val"),
+            "end": entry.get("end"),
+            "concept_used": used_concept,
+        }
 
-    # Sort by val (descending) — values are strings, need to handle
+    user_data = _fetch_for(ticker) if user_cik else {"ticker": ticker, "error": "CIK not found"}
+    peer_data = [_fetch_for(p) for p in target_peers]
+
+    # Sort peers by value (descending); None at the end
     def _to_float(v: Any) -> float:
         try:
             return float(v)
         except (TypeError, ValueError):
             return float("-inf")
 
-    sorted_data = sorted(all_data, key=lambda r: _to_float(r.get("val")), reverse=True)
-    ticker_map = _get_company_ticker_map()
-
-    # Find user's company by ticker
-    user_cik = None
-    user_entry = None
-    for entry in ticker_map.values():
-        if entry.get("ticker", "").upper() == ticker.upper().replace(".", "-"):
-            user_cik = str(entry.get("cik_str", "")).zfill(10)
-            user_entry = entry
-            break
-
-    user_rank = None
-    user_val = None
-    for i, row in enumerate(sorted_data):
-        if str(row.get("cik", "")).zfill(10) == user_cik:
-            user_rank = i + 1
-            user_val = row.get("val")
-            break
+    peer_data.sort(key=lambda r: _to_float(r.get("value")), reverse=True)
 
     lines = [
-        f"SEC XBRL Frame: {concept} (USD, {period_fiscal_year}-{period_fiscal_period})",
-        f"Total filers in frame: {len(sorted_data)}",
+        f"SEC EDGAR peer comparison: {concept} (USD, latest FY)",
+        f"Concept variants tried: {candidates}",
+        f"Total peers requested: {len(peer_list)} | shown: {len(peer_data)}",
         "",
     ]
 
-    if user_val is not None:
-        company_name = user_entry.get("title", ticker) if user_entry else ticker
-        lines.append(f"USER COMPANY: {ticker} ({company_name})")
-        lines.append(f"  Value: {user_val:,.0f} USD")
-        lines.append(f"  Rank: #{user_rank} out of {len(sorted_data)}")
+    if user_data.get("value") is not None:
+        lines.append(f"USER: {ticker} ({user_entry.get('title', ticker) if user_entry else ticker})")
+        lines.append(f"  Value: {float(user_data['value']):,.0f} USD (FY end: {user_data.get('end', '?')})")
+        lines.append(f"  Concept: {user_data.get('concept_used', concept)}")
         lines.append("")
     else:
-        lines.append(f"USER COMPANY: {ticker} — not found in this frame")
+        lines.append(f"USER: {ticker} — {user_data.get('error', 'no data')}")
         lines.append("")
 
-    lines.append(f"Top {top_n} filers by {concept}:")
-    for i, row in enumerate(sorted_data[:top_n], 1):
-        cik = str(row.get("cik", "")).zfill(10)
-        entity = row.get("entityName") or _cik_to_name(cik, ticker_map)
-        val = row.get("val", "?")
-        try:
-            val_str = f"{float(val):>20,.0f}"
-        except (TypeError, ValueError):
-            val_str = str(val)
-        lines.append(f"  {i:>2}. {entity[:40]:40} {val_str:>22} USD")
-
-    if user_rank is not None and user_rank > top_n:
-        lines.append("")
-        lines.append(f"  ... ({ticker} is ranked #{user_rank}, beyond top {top_n})")
+    lines.append(f"Peer comparison (top {len(peer_data)}):")
+    for i, row in enumerate(peer_data, 1):
+        if row.get("value") is None:
+            lines.append(f"  {i:>2}. {row['ticker']:6} — {row.get('error', 'no data')}")
+        else:
+            try:
+                val_str = f"{float(row['value']):>20,.0f}"
+            except (TypeError, ValueError):
+                val_str = str(row["value"])
+            lines.append(
+                f"  {i:>2}. {row['ticker']:6} {row['name'][:30]:30} {val_str:>22} USD  "
+                f"(end: {row.get('end', '?')})"
+            )
 
     return "\n".join(lines)

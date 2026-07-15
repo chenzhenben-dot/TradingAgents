@@ -27,18 +27,28 @@ def _get_api_key() -> str | None:
     return os.environ.get("EIA_API_KEY") or os.environ.get("EIA_TOKEN")
 
 
-# Series IDs (v2 API)
+# Series IDs (v2 API). Electricity series use a different facet-based
+# query that isn't supported by our simple per-series fetch — those are
+# marked None and gracefully reported as "not implemented" in the output.
 SERIES = {
     "wti_crude_oil": "PET.RWTC.W",          # Cushing WTI spot, $/bbl, daily
     "brent_crude_oil": "PET.RBRTE.W",       # Brent spot, $/bbl, daily
     "henry_hub_gas": "NG.RNGWHHD.W",        # Henry Hub natural gas, $/MMBtu, daily
-    "us_electricity_residential": "ELEC.PRICE.RES.US.A",  # cents/kWh, annual
-    "us_electricity_industrial": "ELEC.PRICE.IND.US.A",   # cents/kWh, annual
+    # Electricity uses facet-based query at
+    # /v2/electricity/retail-sales/data/ with stateid/sectorid facets
+    # rather than a flat series ID. Not yet implemented.
+    "us_electricity_residential": None,
+    "us_electricity_industrial": None,
 }
 
 
 def _fetch_series(series_id: str, length: int = 30, api_key: str = "") -> list[dict[str, Any]]:
-    """Fetch recent observations for a v2 series."""
+    """Fetch recent observations for a v2 series.
+
+    Returns empty list if series_id is None (series disabled) or fetch fails.
+    """
+    if series_id is None:
+        return []
     url = f"{API_V2_URL}seriesid/{series_id}"
     params = {
         "api_key": api_key,
@@ -105,6 +115,9 @@ def get_energy_context() -> str:
         ("US Avg Industrial Electricity (¢/kWh)", SERIES["us_electricity_industrial"], "¢/kWh"),
     ]
     for name, sid, unit in targets:
+        if sid is None:
+            lines.append(f"  {name}: data unavailable (EIA v2 facet-based query, not yet implemented)")
+            continue
         try:
             rows = _fetch_series(sid, length=5, api_key=api_key)
             lines.append(_format_series(name, unit, rows))
